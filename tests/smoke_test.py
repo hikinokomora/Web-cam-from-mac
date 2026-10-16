@@ -21,8 +21,8 @@ def report(msg, level="notice"):
     """In GitHub Actions also emit an annotation (readable through the public API)."""
     print(msg, flush=True)
     if IN_CI:
-        print(f"::{level}::{sys.platform}: {msg}".replace("
-", "%0A"), flush=True)
+        text = f"{sys.platform}: {msg}".replace(chr(10), "%0A")
+        print(f"::{level}::{text}", flush=True)
 
 
 def check_i18n():
