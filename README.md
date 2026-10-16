@@ -18,6 +18,7 @@ The camera shows up on the PC as **OBS Virtual Camera**, so it works in any prog
 - **Finds the Mac automatically**, even with a VPN on the PC. You can also enter the IP by hand.
 - **Privacy:** the Mac's camera turns on only while the PC is connected. Video never leaves your local network.
 - If the connection drops, the virtual camera keeps running with a placeholder and reconnects by itself.
+- Lightweight: the Windows app uses about 40–75 MB of RAM.
 - English and Russian interface (follows the system language, switchable).
 
 ## Download

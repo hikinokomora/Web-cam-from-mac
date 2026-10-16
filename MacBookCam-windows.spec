@@ -11,7 +11,8 @@ a = Analysis(
     datas=datas + vc_datas,
     binaries=vc_bins,
     hiddenimports=vc_hidden,
-    excludes=["rumps", "AppKit", "AVFoundation"],
+    excludes=["rumps", "AppKit", "AVFoundation", "cv2", "macbookcam.server", "macbookcam.avf_capture",
+              "darkdetect._mac_detect", "unittest", "pydoc", "test"],
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="MacBookCam", icon="assets/icon.ico",

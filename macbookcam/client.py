@@ -1,14 +1,21 @@
-"""Сторона ПК: приём кадров с Mac, сглаживание и вывод в виртуальную камеру."""
+"""
+Сторона ПК: приём кадров с Mac, сглаживание и вывод в виртуальную камеру.
+
+Без OpenCV: JPEG распаковывает Pillow (libjpeg-turbo), поэтому приложение на ПК
+легче на ~20 МБ. В очереди лежат сжатые кадры, распаковка — прямо перед показом.
+"""
 
 import collections
+import io
 import json
+import os
 import socket
 import struct
 import threading
 import time
 
-import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from .i18n import tr
 from .protocol import (DEFAULT_PORT, FRAME_HEADER, FRAME_HEADER_SIZE, MAX_FRAME_SIZE,
@@ -60,7 +67,7 @@ class StreamReceiver:
         self.stats_fps = 0.0
         self.stats_mbps = 0.0
         self.net = NetStats()
-        self.queue = collections.deque(maxlen=120)  # (метка съёмки, время прихода, кадр)
+        self.queue = collections.deque(maxlen=30)  # (метка съёмки, время прихода, JPEG)
         self.last_arrival = 0.0
         self._cv = threading.Condition()
         self._sock = None
@@ -138,13 +145,10 @@ class StreamReceiver:
                     raise ValueError("bad frame size")
                 data = recv_exact(sock, size)
                 arrived = time.time()
-                frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
                 ts = ts_ms / 1000.0
                 self.net.add(arrived, arrived - ts)
                 with self._cv:
-                    self.queue.append((ts, arrived, frame))
+                    self.queue.append((ts, arrived, data))
                     self.last_arrival = arrived
                     self._cv.notify_all()
                 n += 1
@@ -176,35 +180,54 @@ class StreamReceiver:
             self._cv.notify_all()
 
 
-def fit_frame(frame, width, height):
-    """Вписывает кадр в нужный размер с сохранением пропорций (чёрные поля)."""
-    h, w = frame.shape[:2]
-    if (w, h) == (width, height):
-        return frame
-    scale = min(width / w, height / h)
-    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-    out = np.zeros((height, width, 3), np.uint8)
-    x, y = (width - nw) // 2, (height - nh) // 2
-    out[y:y + nh, x:x + nw] = resized
-    return out
+def decode_frame(data, width, height, mirror=False):
+    """
+    JPEG → RGB-картинка нужного размера. Если кадр больше нужного, Pillow уменьшает его
+    прямо при распаковке (draft), это и быстрее, и экономнее по памяти.
+    Пропорции сохраняются, лишнее заполняется чёрным.
+    """
+    img = Image.open(io.BytesIO(data))
+    img.draft("RGB", (width, height))
+    img = img.convert("RGB")
+    if img.size != (width, height):
+        scale = min(width / img.width, height / img.height)
+        size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        img = img.resize(size, Image.Resampling.BILINEAR, reducing_gap=2.0)
+        if img.size != (width, height):
+            canvas = Image.new("RGB", (width, height))
+            canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+            img = canvas
+    if mirror:
+        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return img
+
+
+def _font(size, bold=False):
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    names = ["segoeuib.ttf" if bold else "segoeui.ttf", "arialbd.ttf" if bold else "arial.ttf"]
+    for name in names:
+        try:
+            return ImageFont.truetype(os.path.join(windir, "Fonts", name), size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def placeholder(width, height, text):
-    img = np.full((height, width, 3), 30, np.uint8)
-    scale = height / 720
-    cv2.putText(img, "MacBookCam", (int(40 * scale), height // 2 - int(30 * scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 2 * scale, (200, 200, 200), max(1, int(3 * scale)))
-    # OpenCV не рисует кириллицу, поэтому на заглушке — только латиница
-    cv2.putText(img, text, (int(40 * scale), height // 2 + int(40 * scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, scale, (150, 150, 150), max(1, int(2 * scale)))
+    """Заглушка для виртуальной камеры, пока нет кадров с Mac."""
+    img = Image.new("RGB", (width, height), (24, 25, 28))
+    d = ImageDraw.Draw(img)
+    s = height / 720
+    title, sub = _font(int(44 * s), bold=True), _font(int(24 * s))
+    d.text((width / 2, height / 2 - 22 * s), "MacBookCam", font=title, fill=(235, 236, 240), anchor="ms")
+    d.text((width / 2, height / 2 + 26 * s), text, font=sub, fill=(140, 143, 150), anchor="ms")
     return img
 
 
 def open_virtual_camera(width, height, fps, backend=None):
     import pyvirtualcam
     kwargs = {"width": width, "height": height, "fps": fps,
-              "fmt": pyvirtualcam.PixelFormat.BGR, "print_fps": False}
+              "fmt": pyvirtualcam.PixelFormat.RGB, "print_fps": False}
     if backend:
         kwargs["backend"] = backend
     return pyvirtualcam.Camera(**kwargs)
@@ -225,7 +248,7 @@ class Bridge:
         self.width, self.height, self.fps = width, height, fps
         self.mirror = mirror
         self.smoothing = smoothing
-        self.output = None      # последний отправленный кадр (для предпросмотра)
+        self.output = None      # последний отправленный кадр, PIL.Image (для предпросмотра)
         self.output_seq = 0     # растёт с каждым новым кадром на выходе
         self.backend = backend
         self.buffer_ms = 0.0    # текущий буфер сглаживания
@@ -250,16 +273,20 @@ class Bridge:
     def connected(self):
         return self.rx.connected
 
-    def _emit(self, frame):
-        out = fit_frame(frame, self.width, self.height)
-        if self.mirror:
-            out = cv2.flip(out, 1)
-        self.output = out
+    def _emit(self, data):
+        try:
+            img = decode_frame(data, self.width, self.height, self.mirror)
+        except Exception:  # noqa: BLE001  (битый кадр — пропускаем)
+            return
+        self._send(img)
+
+    def _send(self, img):
+        self.output = img
         self.output_seq += 1
         if self.cam is not None:
             self._match_vcam_fps()
         if self.cam is not None:
-            self.cam.send(out)
+            self.cam.send(np.asarray(img))
 
     def _match_vcam_fps(self):
         """
@@ -302,16 +329,19 @@ class Bridge:
         out_times = collections.deque(maxlen=90)
         buffer_s = 0.0
         last_placeholder = 0.0
+        ph, ph_text = None, None
         try:
             while self._running:
                 # заглушка, если кадров давно нет
                 if time.time() - rx.last_arrival > 3:
                     if time.time() - last_placeholder > 1 / max(1, self.fps):
                         text = "Waiting for MacBook camera..." if rx.last_arrival else "Connecting..."
-                        ph = placeholder(self.width, self.height, text)
+                        if ph_text != text:
+                            ph, ph_text = placeholder(self.width, self.height, text), text
                         self.output = ph
+                        self.output_seq += 1
                         if self.cam is not None:
-                            self.cam.send(ph)
+                            self.cam.send(np.asarray(ph))
                         last_placeholder = time.time()
                     rx.wait_new(0.05)
                     continue

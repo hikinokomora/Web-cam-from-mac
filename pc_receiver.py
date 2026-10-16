@@ -12,8 +12,6 @@ Usage:
 import argparse
 import time
 
-import cv2
-
 from macbookcam.client import SMOOTHING, Bridge
 from macbookcam.i18n import set_language, tr
 from macbookcam.protocol import DEFAULT_PORT, log
@@ -50,12 +48,16 @@ def main():
     if bridge.vcam_name:
         log(tr("log_vcam_ready", name=bridge.vcam_name))
 
+    if args.preview:
+        import cv2  # только для окна предпросмотра
+        import numpy as np
+
     last_stats = time.time()
     try:
         while True:
             if args.preview:
                 if bridge.output is not None:
-                    cv2.imshow("MacBookCam (Esc)", bridge.output)
+                    cv2.imshow("MacBookCam (Esc)", np.asarray(bridge.output)[:, :, ::-1])
                 if cv2.waitKey(15) & 0xFF == 27:
                     break
             else:
