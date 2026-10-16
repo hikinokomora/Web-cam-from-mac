@@ -1,6 +1,7 @@
 """Сторона Mac: захват камеры и раздача кадров по TCP."""
 
 import json
+import select
 import socket
 import struct
 import sys
@@ -13,6 +14,14 @@ import numpy as np
 from .i18n import tr
 from .protocol import (DEFAULT_PORT, DISCOVERY_MAGIC, DISCOVERY_PORT, FRAME_HEADER,
                        PROTOCOL_VERSION, log, recv_line, send_json_line)
+
+
+# Предел неотправленных данных в сокете. Пока он превышен, сокет «не готов к записи», и мы
+# не кладём в него новый кадр: так кадры не копятся в очереди, а устаревшие просто
+# пропускаются. Значение 0x201 — macOS, 25 — Linux; в Windows опции нет.
+TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT",
+                            {"darwin": 0x201, "linux": 25}.get(sys.platform))
+NOTSENT_LOWAT_BYTES = 16 * 1024
 
 
 class CameraError(RuntimeError):
@@ -179,17 +188,20 @@ class TestPatternSource:
 
 
 def open_source(camera, width, height, fps, test_pattern=False):
+    """Возвращает (источник, причина отката на OpenCV или '')."""
     if test_pattern:
-        return TestPatternSource(width, height, fps)
+        return TestPatternSource(width, height, fps), ""
+    fallback_reason = ""
     if sys.platform == "darwin":
         try:
             from .avf_capture import AVFoundationSource
             src = AVFoundationSource(camera, width, height, fps)
             src.backend = "avfoundation"
-            return src
+            return src, ""
         except Exception as e:  # noqa: BLE001
-            log(f"AVFoundation capture failed ({e!r}), falling back to OpenCV")
-    return CameraSource(camera, width, height, fps)
+            fallback_reason = f"{type(e).__name__}: {e}"[:600]
+            log(f"AVFoundation capture failed ({fallback_reason}), falling back to OpenCV")
+    return CameraSource(camera, width, height, fps), fallback_reason
 
 
 class StreamServer:
@@ -333,7 +345,7 @@ class StreamServer:
         log(tr("log_client_request", ip=addr[0], w=width, h=height, fps=fps, q=quality))
 
         try:
-            source = open_source(self.camera, width, height, fps, self.test_pattern)
+            source, fallback_reason = open_source(self.camera, width, height, fps, self.test_pattern)
         except CameraError as e:
             self.error_code = e.code
             send_json_line(conn, {"error": tr("err_" + e.code), "code": e.code})
@@ -341,19 +353,33 @@ class StreamServer:
             return
 
         try:
-            send_json_line(conn, {"version": PROTOCOL_VERSION, "width": source.width,
-                                  "height": source.height, "fps": source.fps,
-                                  "max_fps": round(source.max_fps), "backend": source.backend})
+            info = {"version": PROTOCOL_VERSION, "width": source.width,
+                    "height": source.height, "fps": source.fps,
+                    "max_fps": round(source.max_fps), "backend": source.backend}
+            if fallback_reason:
+                info["backend_error"] = fallback_reason
+            if getattr(source, "formats", None):
+                info["formats"] = source.formats
+            send_json_line(conn, info)
             self.stream_info = f"{source.width}x{source.height}@{source.fps}"
             log(tr("log_stream_started", info=self.stream_info, backend=source.backend,
                    max_fps=round(source.max_fps)))
             self._notify()
             conn.settimeout(10)
+            if TCP_NOTSENT_LOWAT is not None:
+                try:
+                    conn.setsockopt(socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT, NOTSENT_LOWAT_BYTES)
+                except OSError:
+                    pass
 
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
             seq = sent = bytes_sent = 0
             t0 = time.time()
             while self._running and self.enabled:
+                # ждём, пока сеть заберёт предыдущий кадр, и только потом берём самый свежий
+                _, writable, _ = select.select([], [conn], [], 1.0)
+                if not writable:
+                    continue
                 new_seq, frame, ts = source.wait_frame(seq)
                 if new_seq == seq:
                     continue  # нового кадра не было — повторно не шлём

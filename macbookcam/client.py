@@ -15,7 +15,7 @@ from .protocol import (DEFAULT_PORT, FRAME_HEADER, FRAME_HEADER_SIZE, MAX_FRAME_
                        discover, log, recv_exact, recv_line, send_json_line)
 
 # Режимы буфера сглаживания: доля «запаса» к измеренной неровности сети
-SMOOTHING = {"off": None, "auto": (95, 1.0, 8), "strong": (99, 1.5, 25)}
+SMOOTHING = {"off": None, "auto": (90, 1.0, 4), "strong": (98, 1.3, 15)}
 WINDOW_S = 8.0  # окно статистики сети, секунд
 
 

@@ -81,6 +81,7 @@ STRINGS = {
         "stats_line": "{fps} fps · {mbps} Mbit/s · network jitter ±{jitter} ms · buffer {buffer} ms · "
                       "frame pacing ±{pacing} ms",
         "camera_fps_limit": "The Mac camera supports at most {max_fps} fps.",
+        "camera_fallback": "The Mac uses the fallback capture (30 fps max): {reason}",
         "vcam_name": "Virtual camera: {name}",
         "vcam_placeholder": "Virtual camera: {name} (showing a placeholder)",
         # меню на Mac
@@ -181,6 +182,7 @@ STRINGS = {
         "stats_line": "{fps} к/с · {mbps} Мбит/с · неровность сети ±{jitter} мс · буфер {buffer} мс · "
                       "ровность кадров ±{pacing} мс",
         "camera_fps_limit": "Камера Mac выдаёт максимум {max_fps} к/с.",
+        "camera_fallback": "Mac использует запасной захват (до 30 к/с): {reason}",
         "vcam_name": "Виртуальная камера: {name}",
         "vcam_placeholder": "Виртуальная камера: {name} (показывает заглушку)",
         "mac_streaming_enabled": "Трансляция включена",

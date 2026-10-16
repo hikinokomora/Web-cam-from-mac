@@ -367,7 +367,9 @@ class App(ctk.CTk):
                             jitter=f"{b.jitter_ms:.0f}", buffer=f"{b.buffer_ms:.0f}",
                             pacing=f"{b.pacing_ms:.1f}")]
                 max_fps = rx.info.get("max_fps")
-                if max_fps and b.fps > max_fps:
+                if rx.info.get("backend_error"):
+                    lines.append(tr("camera_fallback", reason=rx.info["backend_error"].splitlines()[0][:160]))
+                elif max_fps and b.fps > max_fps:
                     lines.append(tr("camera_fps_limit", max_fps=max_fps))
                 lines.append(tr("vcam_name", name=b.vcam_name))
                 self.stats.configure(text="\n".join(lines))
