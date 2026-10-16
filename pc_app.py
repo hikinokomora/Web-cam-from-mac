@@ -38,7 +38,7 @@ def resource_path(name):
 
 def load_settings():
     try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
+        with open(SETTINGS_PATH, encoding="utf-8-sig") as f:
             return {**DEFAULTS, **json.load(f)}
     except (OSError, ValueError):
         return dict(DEFAULTS)
@@ -202,11 +202,14 @@ class App(ctk.CTk):
         saved = self.settings["mac"]
         self.mac_menu.set(saved if saved in values else (values[1] if len(values) > 1 else AUTO))
         if not self.bridge:
-            if found:
-                self.status.configure(text=f"Найдено Mac: {len(found)}. Нажмите «Подключить».")
+            manual = self.ip_entry.get().strip()
+            if manual:
+                self.status.configure(text=f"Нажмите «Подключить» — подключение к {manual}.")
+            elif found:
+                self.status.configure(text=f"Найден Mac: {', '.join(self.macs)}. Нажмите «Подключить».")
             else:
-                self.status.configure(text="Mac не найден. Запустите MacBookCam на Mac "
-                                           "или впишите его IP вручную.")
+                self.status.configure(text="Mac не найден автопоиском. Впишите IP из меню значка "
+                                           "на Mac в поле «IP вручную» и нажмите «Подключить».")
 
     # --- подключение ---
 

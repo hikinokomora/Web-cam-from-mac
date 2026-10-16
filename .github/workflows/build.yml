@@ -52,11 +52,20 @@ jobs:
           kill -0 $pid || { echo "App exited early"; exit 1; }
           nc -z 127.0.0.1 5005 && echo "Port 5005 is listening"
           kill $pid
-      - run: ditto -c -k --keepParent dist/MacBookCam.app MacBookCam-Mac-${{ matrix.arch }}.zip
+      - name: Make DMG
+        run: |
+          mkdir dmg
+          cp -R dist/MacBookCam.app dmg/
+          ln -s /Applications dmg/Applications
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname MacBookCam -srcfolder dmg -ov -format UDZO               MacBookCam-Mac-${{ matrix.arch }}.dmg && break
+            sleep 5
+          done
+          test -f MacBookCam-Mac-${{ matrix.arch }}.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: MacBookCam-Mac-${{ matrix.arch }}
-          path: MacBookCam-Mac-${{ matrix.arch }}.zip
+          path: MacBookCam-Mac-${{ matrix.arch }}.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

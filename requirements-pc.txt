@@ -3,3 +3,4 @@ numpy
 pyvirtualcam
 customtkinter
 pillow
+psutil
