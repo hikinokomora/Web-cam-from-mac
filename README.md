@@ -1,75 +1,98 @@
 # MacBookCam
 
-Камера MacBook как обычная веб-камера на Windows-ПК (Zoom, Teams, Discord, Telegram, браузер), по локальной сети.
+**Use your MacBook's camera as a webcam on a Windows PC, over your local Wi-Fi.**
+
+[Русская версия](README.ru.md)
+
+![MacBookCam on Windows](docs/screenshot-windows.png)
 
 ```
-MacBook (значок в строке меню) ── Wi-Fi ──► ПК (окно MacBookCam) ──► OBS Virtual Camera ──► Zoom
+MacBook (menu bar app) ── Wi-Fi ──► PC (MacBookCam window) ──► "OBS Virtual Camera" ──► any app
 ```
 
-- На Mac камера включается только пока подключён ПК.
-- ПК находит Mac сам, можно указать IP вручную.
-- Если связь пропала, виртуальная камера не исчезает: Zoom показывает заглушку, а приложение само переподключается.
-- Задержка на 5 ГГц Wi-Fi: обычно 60–150 мс, трафик при 720p/30 — 8–25 Мбит/с.
+The camera shows up on the PC as **OBS Virtual Camera**, so it works in any program that can pick a webcam: video calls, streaming software, messengers, the browser.
 
-## Установка
+- **Free and open source** (MIT).
+- **Up to 1080p and 60 fps**, if the camera supports it. Built-in MacBook cameras usually top out at 30 fps; an iPhone via Continuity Camera or a USB camera plugged into the Mac can do 60.
+- **Smooth playback:** a jitter buffer evens out Wi-Fi hiccups, so every frame stays on screen for the same time.
+- **Finds the Mac automatically**, even with a VPN on the PC. You can also enter the IP by hand.
+- **Privacy:** the Mac's camera turns on only while the PC is connected. Video never leaves your local network.
+- If the connection drops, the virtual camera keeps running with a placeholder and reconnects by itself.
+- English and Russian interface (follows the system language, switchable).
 
-Готовые сборки лежат в [Releases](../../releases) (или во вкладке Actions → последняя сборка → Artifacts).
+## Download
 
-### Windows-ПК
-1. Установите [OBS Studio](https://obsproject.com). Он нужен только как драйвер «OBS Virtual Camera»; запускать сам OBS не надо.
-2. Скачайте `MacBookCam-Windows.exe` и запустите.
-   Если Windows SmartScreen предупредит о неизвестном издателе: «Подробнее» → «Выполнить в любом случае».
+Get the latest files from **[Releases](../../releases/latest)**:
 
-### MacBook
-1. Скачайте образ под свой Mac:
-   - `MacBookCam-Mac-AppleSilicon.dmg` — M1/M2/M3/M4;
-   - `MacBookCam-Mac-Intel.dmg` — Mac с процессором Intel.
-   (Какой у вас: меню  → «Об этом Mac» → «Чип» или «Процессор».)
-2. Откройте `.dmg` и перетащите `MacBookCam` в папку «Программы».
-3. Приложение не подписано сертификатом Apple, поэтому при первом запуске macOS его заблокирует. Выполните в Терминале один раз:
+| File | For |
+|---|---|
+| `MacBookCam-Windows.exe` | Windows 10/11 PC |
+| `MacBookCam-Mac-AppleSilicon.dmg` | Mac with M1/M2/M3/M4 |
+| `MacBookCam-Mac-Intel.dmg` | Mac with an Intel processor |
+
+Not sure which Mac you have:  menu → About This Mac → "Chip" (Apple M…) or "Processor" (Intel).
+
+## Setup
+
+### Windows PC
+1. Install [OBS Studio](https://obsproject.com/download). MacBookCam uses its virtual camera driver; you don't need to run OBS itself.
+2. Run `MacBookCam-Windows.exe`. If SmartScreen warns about an unknown publisher: **More info → Run anyway**.
+
+### Mac
+1. Open the `.dmg` and drag **MacBookCam** into **Applications**.
+2. The app isn't signed with an Apple Developer certificate, so macOS blocks it on first launch. Run once in Terminal:
    ```bash
    xattr -dr com.apple.quarantine /Applications/MacBookCam.app
    ```
-   (или: Системные настройки → Конфиденциальность и безопасность → внизу «MacBookCam заблокирован» → «Всё равно открыть».)
-4. Запустите. В строке меню рядом с часами появится значок камеры. На запрос доступа к камере нажмите «Разрешить».
+   Or: System Settings → Privacy & Security → scroll down → "MacBookCam was blocked" → **Open Anyway**.
+3. Launch it. A camera icon appears in the menu bar. Allow camera access when asked.
 
-## Использование
+## Usage
 
-1. **Mac:** запустите MacBookCam (значок в строке меню). Окна у приложения нет: всё в меню значка.
-2. **ПК:** запустите MacBookCam, выберите Mac (или оставьте «Автопоиск») и нажмите **«Подключить»**.
-3. **Zoom:** Настройки → Видео → Камера → **OBS Virtual Camera**.
+1. **Mac:** start MacBookCam (menu bar icon; there's no window).
+2. **PC:** start MacBookCam, keep "Auto-detect" (or pick your Mac / type its IP), press **Connect**.
+3. **In your app:** choose the camera **OBS Virtual Camera**.
 
-Меню на Mac: статус и IP (клик копирует IP), пауза трансляции, выбор камеры, «Отключить ПК», автозапуск при входе.
-Окно на ПК: выбор Mac или IP вручную, разрешение (480p/720p/1080p), частота кадров, качество JPEG, отражение, автоподключение при запуске.
+Keep the MacBook lid open (the camera is in it) and don't let the Mac go to sleep.
 
-Держите крышку MacBook открытой (камера в ней) и не давайте Mac уснуть.
+### Settings on the PC
 
-## Если не работает
-
-- **«Mac не найден»:** роутер может блокировать широковещание (гостевые сети, «изоляция клиентов»). VPN на ПК поиску не мешает: MacBookCam ищет Mac через каждый сетевой адаптер. Посмотрите IP в меню значка на Mac и впишите его на ПК в поле «IP вручную».
-- **Подключение не проходит даже по IP:** проверьте брандмауэр macOS (Настройки → Сеть → Брандмауэр) и что оба устройства в одной сети. Если macOS спросит о доступе к локальной сети, разрешите.
-- **На Mac ошибка камеры:** меню значка → «Открыть настройки доступа к камере» → включите MacBookCam и перезапустите приложение.
-- **«Нет виртуальной камеры»:** установите OBS. Если OBS запущен и в нём включена виртуальная камера, остановите её.
-- **Картинка дёргается или отстаёт:** уменьшите качество JPEG или разрешение, поставьте устройства ближе к роутеру.
-
-## Сборка из исходников
-
-- **Windows:** `build_windows.bat`, результат: `dist\MacBookCam.exe`.
-- **Mac:** `bash build_mac.sh`, результат: `dist/MacBookCam.dmg`.
-- **Автосборка:** GitHub Actions собирает всё при каждом пуше в `main`. Чтобы выпустить релиз, создайте тег `v1.0.0` и запушьте его.
-
-### Консольный режим (без интерфейса)
-
-Нужен установленный Python 3.
-
-- **Mac:** `bash setup_mac.sh`, затем `bash start_mac.command` (параметры: `--list`, `--camera N`, `--test-pattern`).
-- **ПК:** `setup_windows.bat`, затем `.\start_windows.bat` (параметры: `--host IP`, `--width/--height/--fps`, `--quality`, `--mirror`, `--preview`, `--no-vcam`).
-
-Окно на ПК без сборки: `.venv\Scripts\python.exe pc_app.py`. Меню на Mac без сборки: `.venv/bin/python mac_app.py`.
-
-| Файл | Назначение |
+| Setting | What it does |
 |---|---|
-| `mac_app.py` | приложение в строке меню macOS |
-| `pc_app.py` | оконное приложение Windows |
-| `mac_sender.py`, `pc_receiver.py` | консольные версии |
-| `macbookcam/` | общий код: протокол, сервер камеры, приёмник и виртуальная камера |
+| Resolution, fps | What to request from the Mac. If the camera can't do the requested fps, the window says so. |
+| JPEG quality | Lower means less traffic and slightly less delay. |
+| Smoothing | **Off**: lowest delay, frames shown as they arrive. **Auto**: a small buffer sized to the measured Wi-Fi jitter (recommended). **Strong**: the smoothest picture for unstable Wi-Fi, at the cost of extra delay. |
+| Mirror | Flips the picture horizontally. |
+| Connect on startup | Connects automatically when the app opens. |
+
+The status line shows the real frame rate, bitrate, Wi-Fi jitter, buffer size and how evenly frames are delivered.
+
+### Mac menu
+
+Status and IP address (click to copy), pause streaming, choose the camera (built-in, iPhone, USB), disconnect the PC, launch at login, language.
+
+## Troubleshooting
+
+- **"Mac not found":** the router may block broadcast (guest networks, "client isolation"). Copy the IP from the Mac menu and enter it on the PC.
+- **No connection even by IP:** make sure both devices are on the same network, and check the macOS firewall (System Settings → Network → Firewall). If macOS asks about local network access, allow it.
+- **Camera error on the Mac:** Mac menu → "Open camera permission settings" → enable MacBookCam, then restart the app.
+- **"No virtual camera" on the PC:** install OBS Studio. If OBS is running with its own virtual camera on, stop it.
+- **Stutter or high jitter:** set Smoothing to Strong, lower the resolution or JPEG quality, move closer to the router, use 5 GHz Wi-Fi. On Macs, the AirDrop/Handoff radio (AWDL) is a known cause of periodic Wi-Fi delay spikes; `sudo ifconfig awdl0 down` turns it off until the next reboot (AirDrop and Handoff stop working meanwhile).
+
+## How it works
+
+The Mac captures the camera with AVFoundation (picking a camera format that supports the requested frame rate), encodes frames to JPEG and streams them over TCP with capture timestamps. The PC decodes them, schedules each frame by its timestamp plus a small adaptive buffer, and feeds the result into the OBS virtual camera via [pyvirtualcam](https://github.com/letmaik/pyvirtualcam). The Mac is discovered with a UDP broadcast on every network adapter.
+
+Ports: TCP 5005 (video), UDP 5006 (discovery).
+
+## Building from source
+
+- **Windows:** `build_windows.bat` → `dist\MacBookCam.exe`
+- **Mac:** `bash build_mac.sh` → `dist/MacBookCam.dmg`
+- **CI:** GitHub Actions builds everything on each push to `main`; pushing a `v*` tag publishes a release.
+
+Console versions without a GUI: `mac_sender.py` (Mac) and `pc_receiver.py` (PC); run them with `--help` for options. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup.
+
+## License
+
+[MIT](LICENSE)

@@ -6,7 +6,8 @@ from macbookcam import __version__
 a = Analysis(
     ["mac_app.py"],
     datas=[("assets", "assets")],
-    hiddenimports=["AVFoundation", "AppKit", "Foundation"],
+    hiddenimports=["AVFoundation", "AppKit", "Foundation", "CoreMedia", "Quartz", "libdispatch",
+                   "macbookcam.avf_capture"],
     excludes=["tkinter", "customtkinter", "pyvirtualcam"],
 )
 pyz = PYZ(a.pure)

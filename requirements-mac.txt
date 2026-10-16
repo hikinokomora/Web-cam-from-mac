@@ -2,3 +2,6 @@ opencv-python-headless
 numpy
 rumps
 pyobjc-framework-AVFoundation
+pyobjc-framework-CoreMedia
+pyobjc-framework-Quartz
+pyobjc-framework-libdispatch

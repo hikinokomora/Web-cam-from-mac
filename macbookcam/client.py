@@ -1,5 +1,6 @@
-"""Сторона ПК: приём кадров с Mac и вывод в виртуальную камеру."""
+"""Сторона ПК: приём кадров с Mac, сглаживание и вывод в виртуальную камеру."""
 
+import collections
 import json
 import socket
 import struct
@@ -9,41 +10,80 @@ import time
 import cv2
 import numpy as np
 
+from .i18n import tr
 from .protocol import (DEFAULT_PORT, FRAME_HEADER, FRAME_HEADER_SIZE, MAX_FRAME_SIZE,
                        discover, log, recv_exact, recv_line, send_json_line)
 
+# Режимы буфера сглаживания: доля «запаса» к измеренной неровности сети
+SMOOTHING = {"off": None, "auto": (95, 1.0, 8), "strong": (99, 1.5, 25)}
+WINDOW_S = 8.0  # окно статистики сети, секунд
+
+
+class NetStats:
+    """
+    Оценка задержки по меткам времени Mac. Часы Mac и ПК не синхронизированы, поэтому
+    считаем d = (время прихода − время съёмки) и берём минимум за окно как «базу»:
+    разница d − база — это то, насколько кадр опоздал из-за сети (джиттер).
+    """
+
+    def __init__(self):
+        self.samples = collections.deque()  # (время прихода, d)
+
+    def add(self, now, d):
+        self.samples.append((now, d))
+        while self.samples and now - self.samples[0][0] > WINDOW_S:
+            self.samples.popleft()
+
+    def base(self):
+        return min(d for _, d in self.samples) if self.samples else 0.0
+
+    def jitter_percentile(self, pct):
+        if len(self.samples) < 5:
+            return 0.0
+        base = self.base()
+        late = sorted(d - base for _, d in self.samples)
+        return late[min(len(late) - 1, int(len(late) * pct / 100))]
+
 
 class StreamReceiver:
-    """Фоновый поток: держит соединение с Mac, переподключается, хранит последний кадр."""
+    """Фоновый поток: держит соединение с Mac, переподключается, складывает кадры в очередь."""
 
     def __init__(self, host, port, width, height, fps, quality):
         self.host, self.port = host, port
         self.request = {"width": width, "height": height, "fps": fps, "quality": quality}
-        self.frame = None
-        self.frame_time = 0.0
         self.connected = False
         self.peer = ""
-        self.status = "Подключение..."
+        self.info = {}
+        self._status = ("status_connecting", {})
         self.stats_fps = 0.0
         self.stats_mbps = 0.0
-        self._lock = threading.Lock()
+        self.net = NetStats()
+        self.queue = collections.deque(maxlen=120)  # (метка съёмки, время прихода, кадр)
+        self.last_arrival = 0.0
+        self._cv = threading.Condition()
         self._sock = None
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    @property
+    def status(self):
+        key, kw = self._status
+        return tr(key, **kw)
+
+    def _set_status(self, key, **kw):
+        self._status = (key, kw)
+
     def _resolve_host(self):
         if self.host:
             return self.host, self.port
-        self.status = "Поиск Mac в сети..."
-        log(self.status)
+        self._set_status("status_searching")
         found = discover()
         if not found:
-            self.status = "Mac не найден. Запустите MacBookCam на Mac или укажите IP."
-            log(self.status)
+            self._set_status("status_not_found")
             return None
         host, port, name = found[0]
-        log(f"Найден {name} ({host}:{port})")
+        log(tr("log_found", name=name, host=host, port=port))
         return host, port
 
     def _loop(self):
@@ -57,8 +97,8 @@ class StreamReceiver:
                 self._session(host, port)
             except (OSError, ConnectionError, ValueError) as e:
                 if self._running:
-                    self.status = f"Нет связи с {host}: {e}"
-                    log(self.status)
+                    self._set_status("status_no_link", host=host, error=e)
+                    log(tr("status_no_link", host=host, error=e))
             finally:
                 self.connected = False
             self._wait(1.5)
@@ -69,50 +109,58 @@ class StreamReceiver:
             time.sleep(0.1)
 
     def _session(self, host, port):
-        self.status = f"Подключение к {host}..."
+        self._set_status("status_connecting_to", host=host)
         sock = socket.create_connection((host, port), timeout=5)
         self._sock = sock
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
             send_json_line(sock, self.request)
             info = json.loads(recv_line(sock).decode("utf-8"))
             if "error" in info:
-                raise ConnectionError(info["error"])
-            log(f"Mac отдаёт {info['width']}x{info['height']}@{info['fps']}")
+                code = info.get("code")
+                raise ConnectionError(tr("err_" + code) if code and tr.has("err_" + code) else info["error"])
+            self.info = info
+            log(tr("log_mac_stream", w=info["width"], h=info["height"], fps=info["fps"]))
             self.connected = True
             self.peer = host
-            self.status = f"Подключено к {host}: {info['width']}x{info['height']}@{info['fps']}"
+            self.net = NetStats()
+            self._set_status("status_connected", host=host, w=info["width"], h=info["height"], fps=info["fps"])
             sock.settimeout(5)
 
             n = nbytes = 0
             t0 = time.time()
             while self._running:
-                size, _ts = struct.unpack(FRAME_HEADER, recv_exact(sock, FRAME_HEADER_SIZE))
+                size, ts_ms = struct.unpack(FRAME_HEADER, recv_exact(sock, FRAME_HEADER_SIZE))
                 if size > MAX_FRAME_SIZE:
-                    raise ValueError("некорректный размер кадра")
+                    raise ValueError("bad frame size")
                 data = recv_exact(sock, size)
+                arrived = time.time()
                 frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
-                with self._lock:
-                    self.frame = frame
-                    self.frame_time = time.time()
+                ts = ts_ms / 1000.0
+                self.net.add(arrived, arrived - ts)
+                with self._cv:
+                    self.queue.append((ts, arrived, frame))
+                    self.last_arrival = arrived
+                    self._cv.notify_all()
                 n += 1
                 nbytes += size + FRAME_HEADER_SIZE
-                dt = time.time() - t0
+                dt = arrived - t0
                 if dt >= 2:
                     self.stats_fps = n / dt
                     self.stats_mbps = nbytes * 8 / dt / 1e6
                     n = nbytes = 0
-                    t0 = time.time()
+                    t0 = arrived
         finally:
             self._sock = None
             sock.close()
 
-    def latest(self):
-        with self._lock:
-            return self.frame, self.frame_time
+    def wait_new(self, timeout):
+        with self._cv:
+            if not self.queue:
+                self._cv.wait(timeout)
 
     def stop(self):
         self._running = False
@@ -122,6 +170,8 @@ class StreamReceiver:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        with self._cv:
+            self._cv.notify_all()
 
 
 def fit_frame(frame, width, height):
@@ -161,14 +211,22 @@ def open_virtual_camera(width, height, fps, backend=None):
 class Bridge:
     """
     Связка «приёмник → виртуальная камера» в фоновом потоке.
-    Пока Mac недоступен, в камеру идёт заглушка, чтобы Zoom не терял устройство.
+
+    С буфером сглаживания кадр показывается в момент «время съёмки + база + буфер»,
+    поэтому интервалы между кадрами на выходе повторяют интервалы съёмки на Mac,
+    а не рывки Wi-Fi. Без буфера кадр выводится сразу по приходу (минимальная задержка).
+    Пока Mac недоступен, в камеру идёт заглушка, чтобы программы не теряли устройство.
     """
 
     def __init__(self, host=None, port=DEFAULT_PORT, width=1280, height=720, fps=30,
-                 quality=80, mirror=False, vcam=True, backend=None):
+                 quality=80, mirror=False, vcam=True, backend=None, smoothing="auto"):
         self.width, self.height, self.fps = width, height, fps
         self.mirror = mirror
-        self.output = None  # последний отправленный кадр (для предпросмотра)
+        self.smoothing = smoothing
+        self.output = None      # последний отправленный кадр (для предпросмотра)
+        self.buffer_ms = 0.0    # текущий буфер сглаживания
+        self.jitter_ms = 0.0    # неровность сети (95-й перцентиль)
+        self.pacing_ms = 0.0    # разброс интервалов между кадрами на выходе
         self.vcam_name = ""
         self.cam = None
         if vcam:
@@ -187,36 +245,73 @@ class Bridge:
     def connected(self):
         return self.rx.connected
 
-    def frame_age_ms(self):
-        _, ft = self.rx.latest()
-        return (time.time() - ft) * 1000 if ft else None
+    def _emit(self, frame):
+        out = fit_frame(frame, self.width, self.height)
+        if self.mirror:
+            out = cv2.flip(out, 1)
+        self.output = out
+        if self.cam is not None:
+            self.cam.send(out)
+
+    def _target_buffer(self):
+        mode = SMOOTHING.get(self.smoothing)
+        if mode is None:
+            return 0.0
+        pct, factor, extra_ms = mode
+        return min(0.25, self.rx.net.jitter_percentile(pct) * factor + extra_ms / 1000)
 
     def _loop(self):
-        last_frame_time = 0.0
-        out = placeholder(self.width, self.height, "Connecting...")
-        interval = 1.0 / self.fps
-        next_tick = time.perf_counter()
+        rx = self.rx
+        out_times = collections.deque(maxlen=90)
+        buffer_s = 0.0
+        last_placeholder = 0.0
         try:
             while self._running:
-                frame, ft = self.rx.latest()
-                if frame is not None and ft != last_frame_time:
-                    last_frame_time = ft
-                    out = fit_frame(frame, self.width, self.height)
-                    if self.mirror:
-                        out = cv2.flip(out, 1)
-                elif time.time() - last_frame_time > 3:
-                    out = placeholder(self.width, self.height, "Waiting for MacBook camera...")
-                self.output = out
-                if self.cam is not None:
-                    self.cam.send(out)
-                    self.cam.sleep_until_next_frame()
-                else:
-                    next_tick += interval
-                    delay = next_tick - time.perf_counter()
+                # заглушка, если кадров давно нет
+                if time.time() - rx.last_arrival > 3:
+                    if time.time() - last_placeholder > 1 / max(1, self.fps):
+                        text = "Waiting for MacBook camera..." if rx.last_arrival else "Connecting..."
+                        ph = placeholder(self.width, self.height, text)
+                        self.output = ph
+                        if self.cam is not None:
+                            self.cam.send(ph)
+                        last_placeholder = time.time()
+                    rx.wait_new(0.05)
+                    continue
+
+                # плавно подстраиваем буфер к измеренной неровности сети
+                target = self._target_buffer()
+                buffer_s += (target - buffer_s) * (0.2 if target > buffer_s else 0.02)
+                if target == 0.0:
+                    buffer_s = 0.0
+                self.buffer_ms = buffer_s * 1000
+                self.jitter_ms = rx.net.jitter_percentile(95) * 1000
+
+                with rx._cv:
+                    if not rx.queue:
+                        rx._cv.wait(0.05)
+                        continue
+                    ts, arrived, frame = rx.queue[0]
+
+                if buffer_s > 0:
+                    due = ts + rx.net.base() + buffer_s
+                    delay = due - time.time()
                     if delay > 0:
-                        time.sleep(delay)
-                    else:
-                        next_tick = time.perf_counter()
+                        time.sleep(min(delay, 0.02))
+                        continue
+                with rx._cv:
+                    # если очередь распухла (буфер уменьшился) — пропускаем старые кадры
+                    while len(rx.queue) > 1 and (buffer_s == 0 or
+                                                 rx.queue[1][0] + rx.net.base() + buffer_s <= time.time()):
+                        rx.queue.popleft()
+                    ts, arrived, frame = rx.queue.popleft()
+                self._emit(frame)
+
+                now = time.time()
+                out_times.append(now)
+                if len(out_times) > 10:
+                    iv = np.diff(np.array(out_times))
+                    self.pacing_ms = float(np.std(iv) * 1000)
         finally:
             if self.cam is not None:
                 self.cam.close()
