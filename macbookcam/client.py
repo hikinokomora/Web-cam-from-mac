@@ -15,7 +15,8 @@ from .protocol import (DEFAULT_PORT, FRAME_HEADER, FRAME_HEADER_SIZE, MAX_FRAME_
                        discover, log, recv_exact, recv_line, send_json_line)
 
 # Режимы буфера сглаживания: доля «запаса» к измеренной неровности сети
-SMOOTHING = {"off": None, "auto": (90, 1.0, 4), "strong": (98, 1.3, 15)}
+# (перцентиль опозданий, множитель, запас в мс, предел буфера в мс)
+SMOOTHING = {"off": None, "auto": (99, 1.0, 12, 200), "strong": (99.5, 1.3, 25, 300)}
 WINDOW_S = 8.0  # окно статистики сети, секунд
 
 
@@ -48,9 +49,10 @@ class NetStats:
 class StreamReceiver:
     """Фоновый поток: держит соединение с Mac, переподключается, складывает кадры в очередь."""
 
-    def __init__(self, host, port, width, height, fps, quality):
+    def __init__(self, host, port, width, height, fps, quality, drop_late=False):
         self.host, self.port = host, port
-        self.request = {"width": width, "height": height, "fps": fps, "quality": quality}
+        self.request = {"width": width, "height": height, "fps": fps, "quality": quality,
+                        "drop_late": drop_late}
         self.connected = False
         self.peer = ""
         self.info = {}
@@ -224,6 +226,8 @@ class Bridge:
         self.mirror = mirror
         self.smoothing = smoothing
         self.output = None      # последний отправленный кадр (для предпросмотра)
+        self.output_seq = 0     # растёт с каждым новым кадром на выходе
+        self.backend = backend
         self.buffer_ms = 0.0    # текущий буфер сглаживания
         self.jitter_ms = 0.0    # неровность сети (95-й перцентиль)
         self.pacing_ms = 0.0    # разброс интервалов между кадрами на выходе
@@ -232,7 +236,8 @@ class Bridge:
         if vcam:
             self.cam = open_virtual_camera(width, height, fps, backend)  # может бросить исключение
             self.vcam_name = self.cam.device
-        self.rx = StreamReceiver(host, port, width, height, fps, quality)
+        self.rx = StreamReceiver(host, port, width, height, fps, quality,
+                                 drop_late=SMOOTHING.get(smoothing) is None)
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -250,15 +255,47 @@ class Bridge:
         if self.mirror:
             out = cv2.flip(out, 1)
         self.output = out
+        self.output_seq += 1
+        if self.cam is not None:
+            self._match_vcam_fps()
         if self.cam is not None:
             self.cam.send(out)
+
+    def _match_vcam_fps(self):
+        """
+        Виртуальная камера должна работать на той же частоте, что и камера Mac: иначе программа,
+        читающая её (например, 60 раз в секунду при 30 кадрах), показывает одни кадры дважды,
+        а другие трижды — движение подёргивается.
+        """
+        src_fps = int(self.rx.info.get("fps") or 0)
+        old_fps = int(round(self.cam.fps))
+        if not src_fps or src_fps == old_fps:
+            return
+        # Виртуальная камера OBS бывает только одна, и после закрытия освобождается не сразу
+        # (около полусекунды) — закрываем старую и открываем новую с повторами.
+        self.cam.close()
+        self.cam = self._open_vcam_retry(src_fps) or self._open_vcam_retry(old_fps)
+        if self.cam is None:
+            self.vcam_name = ""
+        elif int(round(self.cam.fps)) != src_fps:
+            self.rx.info["fps"] = int(round(self.cam.fps))  # остаёмся на прежней частоте
+
+    def _open_vcam_retry(self, fps, seconds=2.0):
+        deadline = time.time() + seconds
+        while True:
+            try:
+                return open_virtual_camera(self.width, self.height, fps, self.backend)
+            except Exception:  # noqa: BLE001
+                if time.time() > deadline:
+                    return None
+                time.sleep(0.1)
 
     def _target_buffer(self):
         mode = SMOOTHING.get(self.smoothing)
         if mode is None:
             return 0.0
-        pct, factor, extra_ms = mode
-        return min(0.25, self.rx.net.jitter_percentile(pct) * factor + extra_ms / 1000)
+        pct, factor, extra_ms, cap_ms = mode
+        return min(cap_ms / 1000, self.rx.net.jitter_percentile(pct) * factor + extra_ms / 1000)
 
     def _loop(self):
         rx = self.rx

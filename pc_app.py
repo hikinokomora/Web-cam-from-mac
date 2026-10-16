@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import threading
+import time
 import tkinter.messagebox as messagebox
 import webbrowser
 
@@ -77,6 +78,8 @@ class App(ctk.CTk):
         self.found = []     # [(host, port, name)]
         self._scanning = False
         self._preview_img = None
+        self._preview_seq = -1
+        self._stats_at = 0.0
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -86,7 +89,7 @@ class App(ctk.CTk):
         self.after(100, self.scan)
         if self.settings["autoconnect"]:
             self.after(600, self.toggle_connection)
-        self.after(66, self.tick)
+        self.after(15, self.tick)
 
     # --- разметка ---
 
@@ -352,7 +355,8 @@ class App(ctk.CTk):
         b = self.bridge
         if b:
             frame = b.output
-            if frame is not None:
+            if frame is not None and b.output_seq != self._preview_seq:
+                self._preview_seq = b.output_seq
                 h, w = frame.shape[:2]
                 scale = min(PREVIEW_W / w, PREVIEW_H / h)
                 size = (int(w * scale), int(h * scale))
@@ -360,6 +364,8 @@ class App(ctk.CTk):
                 img = Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
                 self._preview_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
                 self.preview.configure(image=self._preview_img, text="")
+        if b and time.time() - self._stats_at > 0.25:
+            self._stats_at = time.time()
             self.status.configure(text=b.status)
             if b.connected:
                 rx = b.rx
@@ -375,7 +381,7 @@ class App(ctk.CTk):
                 self.stats.configure(text="\n".join(lines))
             else:
                 self.stats.configure(text=tr("vcam_placeholder", name=b.vcam_name))
-        self.after(66, self.tick)
+        self.after(15, self.tick)
 
     def _collect_settings(self):
         self.settings.update({

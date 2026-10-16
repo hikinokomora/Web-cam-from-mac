@@ -1,5 +1,6 @@
 """Сторона Mac: захват камеры и раздача кадров по TCP."""
 
+import collections
 import json
 import select
 import socket
@@ -16,12 +17,15 @@ from .protocol import (DEFAULT_PORT, DISCOVERY_MAGIC, DISCOVERY_PORT, FRAME_HEAD
                        PROTOCOL_VERSION, log, recv_line, send_json_line)
 
 
-# Предел неотправленных данных в сокете. Пока он превышен, сокет «не готов к записи», и мы
-# не кладём в него новый кадр: так кадры не копятся в очереди, а устаревшие просто
-# пропускаются. Значение 0x201 — macOS, 25 — Linux; в Windows опции нет.
+# Режим «без опозданий» (сглаживание выключено на ПК): предел неотправленных данных в сокете.
+# Пока он превышен, сокет «не готов к записи», и устаревшие кадры пропускаются, а не копятся.
+# Значение 0x201 — macOS, 25 — Linux; в Windows опции нет.
 TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT",
                             {"darwin": 0x201, "linux": 25}.get(sys.platform))
 NOTSENT_LOWAT_BYTES = 16 * 1024
+# Обычный режим: кадры, задержанные заминкой Wi-Fi, ждут в очереди и уходят чуть позже —
+# буфер сглаживания на ПК выровняет их. Очередь ограничена, чтобы задержка не росла без конца.
+SEND_QUEUE_FRAMES = 12
 
 
 class CameraError(RuntimeError):
@@ -342,6 +346,7 @@ class StreamServer:
         height = int(req.get("height", 720))
         fps = max(1, min(120, int(req.get("fps", 30))))
         quality = max(10, min(100, int(req.get("quality", self.default_quality))))
+        drop_late = bool(req.get("drop_late", False))
         log(tr("log_client_request", ip=addr[0], w=width, h=height, fps=fps, q=quality))
 
         try:
@@ -366,39 +371,66 @@ class StreamServer:
                    max_fps=round(source.max_fps)))
             self._notify()
             conn.settimeout(10)
-            if TCP_NOTSENT_LOWAT is not None:
+            if drop_late and TCP_NOTSENT_LOWAT is not None:
                 try:
                     conn.setsockopt(socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT, NOTSENT_LOWAT_BYTES)
                 except OSError:
                     pass
 
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
-            seq = sent = bytes_sent = 0
+            # Кадры сжимаются в отдельном потоке сразу по мере съёмки и встают в очередь;
+            # этот поток только отправляет. В режиме drop_late очередь из одного кадра —
+            # всегда самый свежий.
+            queue = collections.deque(maxlen=1 if drop_late else SEND_QUEUE_FRAMES)
+            cond = threading.Condition()
+            alive = {"on": True}
+
+            def produce():
+                encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+                seq = 0
+                while alive["on"]:
+                    new_seq, frame, ts = source.wait_frame(seq)
+                    if new_seq == seq:
+                        continue  # нового кадра не было — повторно не шлём
+                    seq = new_seq
+                    ok, jpg = cv2.imencode(".jpg", frame, encode_params)
+                    if not ok:
+                        continue
+                    with cond:
+                        queue.append((ts, jpg.tobytes()))
+                        cond.notify()
+
+            producer = threading.Thread(target=produce, daemon=True)
+            producer.start()
+
+            sent = bytes_sent = 0
             t0 = time.time()
-            while self._running and self.enabled:
-                # ждём, пока сеть заберёт предыдущий кадр, и только потом берём самый свежий
-                _, writable, _ = select.select([], [conn], [], 1.0)
-                if not writable:
-                    continue
-                new_seq, frame, ts = source.wait_frame(seq)
-                if new_seq == seq:
-                    continue  # нового кадра не было — повторно не шлём
-                seq = new_seq
-                ok, jpg = cv2.imencode(".jpg", frame, encode_params)
-                if not ok:
-                    continue
-                data = jpg.tobytes()
-                # метка времени — момент съёмки кадра, по ней ПК выравнивает показ
-                conn.sendall(struct.pack(FRAME_HEADER, len(data), int(ts * 1000)) + data)
-                sent += 1
-                bytes_sent += len(data)
-                dt = time.time() - t0
-                if dt >= 2:
-                    self.stats_fps = sent / dt
-                    self.stats_mbps = bytes_sent * 8 / dt / 1e6
-                    self._notify()
-                    sent = bytes_sent = 0
-                    t0 = time.time()
+            try:
+                while self._running and self.enabled:
+                    if drop_late:
+                        # ждём, пока сеть заберёт предыдущий кадр, и только потом берём свежий
+                        _, writable, _ = select.select([], [conn], [], 1.0)
+                        if not writable:
+                            continue
+                    with cond:
+                        if not queue:
+                            cond.wait(1.0)
+                            if not queue:
+                                continue
+                        ts, data = queue.popleft()
+                    # метка времени — момент съёмки кадра, по ней ПК выравнивает показ
+                    conn.sendall(struct.pack(FRAME_HEADER, len(data), int(ts * 1000)) + data)
+                    sent += 1
+                    bytes_sent += len(data)
+                    dt = time.time() - t0
+                    if dt >= 2:
+                        self.stats_fps = sent / dt
+                        self.stats_mbps = bytes_sent * 8 / dt / 1e6
+                        self._notify()
+                        sent = bytes_sent = 0
+                        t0 = time.time()
+            finally:
+                alive["on"] = False
+                producer.join(timeout=2)
         finally:
             source.close()
             log(tr("log_camera_off"))
