@@ -54,7 +54,7 @@ Not sure which Mac you have:  menu → About This Mac → "Chip" (Apple M…) or
 2. **PC:** start MacBookCam, keep "Auto-detect" (or pick your Mac / type its IP), press **Connect**.
 3. **In your app:** choose the camera **OBS Virtual Camera**.
 
-Keep the MacBook lid open (the camera is in it) and don't let the Mac go to sleep.
+Keep the MacBook lid open (the camera is in it). While streaming, the Mac won't go to sleep by itself.
 
 ### Settings on the PC
 
@@ -74,6 +74,7 @@ Status and IP address (click to copy), pause streaming, choose the camera (built
 
 ## Troubleshooting
 
+- **The camera drops or freezes during a long call:** update both the Mac and the PC to the latest version; the PC window shows which version the Mac app runs. Since 1.2.1 the Mac stays awake while streaming and a lost connection is restored within a few seconds. If it still happens, send the log files: Windows `%APPDATA%\MacBookCam\log.txt`, Mac `~/Library/Logs/MacBookCam.log`.
 - **"Mac not found":** the router may block broadcast (guest networks, "client isolation"). Copy the IP from the Mac menu and enter it on the PC.
 - **No connection even by IP:** make sure both devices are on the same network, and check the macOS firewall (System Settings → Network → Firewall). If macOS asks about local network access, allow it.
 - **Camera error on the Mac:** Mac menu → "Open camera permission settings" → enable MacBookCam, then restart the app.

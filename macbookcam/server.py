@@ -12,9 +12,11 @@ import time
 import cv2
 import numpy as np
 
+from . import __version__
 from .i18n import tr
+from .power import KeepAwake
 from .protocol import (DEFAULT_PORT, DISCOVERY_MAGIC, DISCOVERY_PORT, FRAME_HEADER,
-                       PROTOCOL_VERSION, log, recv_line, send_json_line)
+                       PROTOCOL_VERSION, enable_keepalive, log, recv_line, send_json_line)
 
 
 # Режим «без опозданий» (сглаживание выключено на ПК): предел неотправленных данных в сокете.
@@ -231,6 +233,8 @@ class StreamServer:
         self._conn = None
         self._udp = None
         self._running = False
+        self._state_lock = threading.Lock()   # защищает _conn
+        self._serve_lock = threading.Lock()   # камера одна: клиенты обслуживаются по очереди
 
     # --- управление ---
 
@@ -239,7 +243,7 @@ class StreamServer:
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("", self.port))
-        self._srv.listen(1)
+        self._srv.listen(8)
         threading.Thread(target=self._accept_loop, daemon=True).start()
         threading.Thread(target=self._discovery_loop, daemon=True).start()
 
@@ -291,7 +295,7 @@ class StreamServer:
             return
         self._udp = sock
         name = socket.gethostname().removesuffix(".local")
-        reply = json.dumps({"name": name, "port": self.port}).encode()
+        reply = json.dumps({"name": name, "port": self.port, "version": __version__}).encode()
         while self._running:
             try:
                 data, addr = sock.recvfrom(1024)
@@ -308,31 +312,61 @@ class StreamServer:
                 conn, addr = self._srv.accept()
             except OSError:
                 break
-            if not self.enabled:
-                try:
-                    send_json_line(conn, {"error": tr("err_paused"), "code": "paused"})
-                except OSError:
-                    pass
-                conn.close()
-                continue
-            self._conn = conn
+            threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
+
+    @staticmethod
+    def _close(conn):
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _shutdown(conn):
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _handle(self, conn, addr):
+        if not self.enabled:
+            try:
+                send_json_line(conn, {"error": tr("err_paused"), "code": "paused"})
+            except OSError:
+                pass
+            self._close(conn)
+            return
+        # Новое подключение вытесняет прежнее. Если ПК пропал из сети «молча» (Wi-Fi моргнул, FIN не
+        # пришёл), Mac ещё долго считает старое соединение живым, и без вытеснения новое ждало бы
+        # в очереди больше 10 секунд.
+        with self._state_lock:
+            old, self._conn = self._conn, conn
+        if old is not None:
+            log(tr("log_client_replaced", ip=addr[0]))
+            self._shutdown(old)
+        with self._serve_lock:  # камера одна: ждём, пока прежний обработчик её освободит
+            if self._conn is not conn:  # пока ждали, пришёл ещё более новый клиент
+                self._close(conn)
+                return
+            started = time.time()
             self.client = addr[0]
             self.error_code = ""
             log(tr("log_client_connected", ip=addr[0]))
             self._notify()
             try:
                 self._serve(conn, addr)
+                log(tr("log_session_ended", secs=int(time.time() - started)))
             except (ConnectionError, OSError) as e:
-                log(tr("log_connection_closed", error=e))
+                log(tr("log_connection_closed", error=e, secs=int(time.time() - started)))
             except Exception as e:  # noqa: BLE001
                 self.error_code = "internal"
                 log(f"Error: {e!r}")
             finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                self._conn = None
+                self._close(conn)
+                with self._state_lock:
+                    if self._conn is conn:
+                        self._conn = None
                 self.client = None
                 self.stream_info = ""
                 self.stats_fps = self.stats_mbps = 0.0
@@ -340,6 +374,7 @@ class StreamServer:
 
     def _serve(self, conn, addr):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        enable_keepalive(conn)
         conn.settimeout(10)
         req = json.loads(recv_line(conn).decode("utf-8"))
         width = int(req.get("width", 1280))
@@ -357,9 +392,10 @@ class StreamServer:
             log(tr("err_" + e.code))
             return
 
+        keep = KeepAwake()
         try:
-            info = {"version": PROTOCOL_VERSION, "width": source.width,
-                    "height": source.height, "fps": source.fps,
+            info = {"version": PROTOCOL_VERSION, "app_version": __version__,
+                    "width": source.width, "height": source.height, "fps": source.fps,
                     "max_fps": round(source.max_fps), "backend": source.backend}
             if fallback_reason:
                 info["backend_error"] = fallback_reason
@@ -369,6 +405,9 @@ class StreamServer:
             self.stream_info = f"{source.width}x{source.height}@{source.fps}"
             log(tr("log_stream_started", info=self.stream_info, backend=source.backend,
                    max_fps=round(source.max_fps)))
+            keep.acquire()
+            if keep.active:
+                log(tr("log_keep_awake"))
             self._notify()
             conn.settimeout(10)
             if drop_late and TCP_NOTSENT_LOWAT is not None:
@@ -403,7 +442,7 @@ class StreamServer:
             producer.start()
 
             sent = bytes_sent = 0
-            t0 = time.time()
+            t0 = last_log = time.time()
             try:
                 while self._running and self.enabled:
                     if drop_late:
@@ -421,16 +460,21 @@ class StreamServer:
                     conn.sendall(struct.pack(FRAME_HEADER, len(data), int(ts * 1000)) + data)
                     sent += 1
                     bytes_sent += len(data)
-                    dt = time.time() - t0
-                    if dt >= 2:
-                        self.stats_fps = sent / dt
-                        self.stats_mbps = bytes_sent * 8 / dt / 1e6
+                    now = time.time()
+                    if now - t0 >= 2:
+                        self.stats_fps = sent / (now - t0)
+                        self.stats_mbps = bytes_sent * 8 / (now - t0) / 1e6
                         self._notify()
                         sent = bytes_sent = 0
-                        t0 = time.time()
+                        t0 = now
+                    if now - last_log >= 30:
+                        log(tr("log_stream_stats", fps=f"{self.stats_fps:.0f}",
+                               mbps=f"{self.stats_mbps:.1f}", queue=len(queue)))
+                        last_log = now
             finally:
                 alive["on"] = False
                 producer.join(timeout=2)
         finally:
+            keep.release()
             source.close()
             log(tr("log_camera_off"))

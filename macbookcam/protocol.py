@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import os
 import select
 import socket
 import sys
@@ -17,14 +18,60 @@ FRAME_HEADER_SIZE = 12
 MAX_FRAME_SIZE = 20_000_000
 
 
-def log(msg):
-    # В оконном .exe/.app нет консоли: sys.stdout там None
-    if sys.stdout is None:
-        return
+_log_path = None
+_LOG_MAX_BYTES = 1_000_000
+
+
+def set_log_file(path):
+    """Дублировать журнал в файл: в оконном приложении консоли нет. Большой старый файл откладывается в .1"""
+    global _log_path
     try:
-        print(time.strftime("[%H:%M:%S] ") + msg, flush=True)
-    except (OSError, ValueError, UnicodeEncodeError):
-        pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > _LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+        _log_path = path
+    except OSError:
+        _log_path = None
+        return
+    from . import __version__
+    log(f"=== MacBookCam {__version__} started ===")
+
+
+def log(msg):
+    now = time.localtime()
+    if sys.stdout is not None:  # в оконном .exe/.app консоли нет
+        try:
+            print(time.strftime("[%H:%M:%S] ", now) + msg, flush=True)
+        except (OSError, ValueError, UnicodeEncodeError):
+            pass
+    if _log_path:
+        try:
+            with open(_log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ", now) + msg + "\n")
+        except OSError:
+            pass
+
+
+def enable_keepalive(sock, idle=5, interval=2, count=3):
+    """Быстро замечать «мёртвое» соединение (Wi-Fi пропал без FIN), а не через минуты."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    if sys.platform == "win32":
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+        except (OSError, AttributeError, ValueError):
+            pass
+        return
+    idle_opt = "TCP_KEEPALIVE" if sys.platform == "darwin" else "TCP_KEEPIDLE"
+    for name, value in ((idle_opt, idle), ("TCP_KEEPINTVL", interval), ("TCP_KEEPCNT", count)):
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except OSError:
+                pass
 
 
 def recv_exact(sock, n):

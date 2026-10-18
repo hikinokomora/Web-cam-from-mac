@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .i18n import tr
 from .protocol import (DEFAULT_PORT, FRAME_HEADER, FRAME_HEADER_SIZE, MAX_FRAME_SIZE,
-                       discover, log, recv_exact, recv_line, send_json_line)
+                       discover, enable_keepalive, log, recv_exact, recv_line, send_json_line)
 
 # Режимы буфера сглаживания: доля «запаса» к измеренной неровности сети
 # (перцентиль опозданий, множитель, запас в мс, предел буфера в мс)
@@ -69,6 +69,7 @@ class StreamReceiver:
         self.net = NetStats()
         self.queue = collections.deque(maxlen=30)  # (метка съёмки, время прихода, JPEG)
         self.last_arrival = 0.0
+        self._session_started = 0.0
         self._cv = threading.Condition()
         self._sock = None
         self._running = True
@@ -107,9 +108,12 @@ class StreamReceiver:
             except (OSError, ConnectionError, ValueError) as e:
                 if self._running:
                     self._set_status("status_no_link", host=host, error=e)
-                    log(tr("status_no_link", host=host, error=e))
+                    secs = int(time.time() - self._session_started) if self._session_started else 0
+                    log(tr("log_session_lost", host=host, secs=secs, error=e) if secs
+                        else tr("status_no_link", host=host, error=e))
             finally:
                 self.connected = False
+                self._session_started = 0.0
             self._wait(1.5)
 
     def _wait(self, seconds):
@@ -124,14 +128,17 @@ class StreamReceiver:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
+            enable_keepalive(sock)
             send_json_line(sock, self.request)
             info = json.loads(recv_line(sock).decode("utf-8"))
             if "error" in info:
                 code = info.get("code")
                 raise ConnectionError(tr("err_" + code) if code and tr.has("err_" + code) else info["error"])
             self.info = info
-            log(tr("log_mac_stream", w=info["width"], h=info["height"], fps=info["fps"]))
+            log(tr("log_mac_stream", w=info["width"], h=info["height"], fps=info["fps"],
+                   version=info.get("app_version", "?")))
             self.connected = True
+            self._session_started = time.time()
             self.peer = host
             self.net = NetStats()
             self._set_status("status_connected", host=host, w=info["width"], h=info["height"], fps=info["fps"])
@@ -256,6 +263,8 @@ class Bridge:
         self.pacing_ms = 0.0    # разброс интервалов между кадрами на выходе
         self.vcam_name = ""
         self.cam = None
+        self._want_vcam = vcam
+        self._vcam_retry_at = 0.0
         if vcam:
             self.cam = open_virtual_camera(width, height, fps, backend)  # может бросить исключение
             self.vcam_name = self.cam.device
@@ -283,39 +292,37 @@ class Bridge:
     def _send(self, img):
         self.output = img
         self.output_seq += 1
-        if self.cam is not None:
-            self._match_vcam_fps()
-        if self.cam is not None:
-            self.cam.send(np.asarray(img))
+        self._send_vcam(img)
 
-    def _match_vcam_fps(self):
+    def _send_vcam(self, img):
         """
-        Виртуальная камера должна работать на той же частоте, что и камера Mac: иначе программа,
-        читающая её (например, 60 раз в секунду при 30 кадрах), показывает одни кадры дважды,
-        а другие трижды — движение подёргивается.
+        Отправка кадра в виртуальную камеру. Если она сломалась (например, перезапустили OBS),
+        открываем её заново не чаще раза в секунду; приём кадров при этом не останавливается.
+        Исправную камеру никогда не переоткрываем: программа, которая её читает (Zoom), теряет устройство.
         """
-        src_fps = int(self.rx.info.get("fps") or 0)
-        old_fps = int(round(self.cam.fps))
-        if not src_fps or src_fps == old_fps:
+        if not self._want_vcam:
             return
-        # Виртуальная камера OBS бывает только одна, и после закрытия освобождается не сразу
-        # (около полусекунды) — закрываем старую и открываем новую с повторами.
-        self.cam.close()
-        self.cam = self._open_vcam_retry(src_fps) or self._open_vcam_retry(old_fps)
-        if self.cam is None:
-            self.vcam_name = ""
-        elif int(round(self.cam.fps)) != src_fps:
-            self.rx.info["fps"] = int(round(self.cam.fps))  # остаёмся на прежней частоте
-
-    def _open_vcam_retry(self, fps, seconds=2.0):
-        deadline = time.time() + seconds
-        while True:
+        if self.cam is not None:
             try:
-                return open_virtual_camera(self.width, self.height, fps, self.backend)
-            except Exception:  # noqa: BLE001
-                if time.time() > deadline:
-                    return None
-                time.sleep(0.1)
+                self.cam.send(np.asarray(img))
+                return
+            except Exception as e:  # noqa: BLE001
+                log(tr("log_vcam_send_failed", error=e))
+                try:
+                    self.cam.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.cam = None
+        now = time.time()
+        if now - self._vcam_retry_at < 1.0:
+            return
+        self._vcam_retry_at = now
+        try:
+            self.cam = open_virtual_camera(self.width, self.height, self.fps, self.backend)
+            self.vcam_name = self.cam.device
+            log(tr("log_vcam_reopened", name=self.vcam_name))
+        except Exception as e:  # noqa: BLE001
+            log(tr("log_vcam_reopen_failed", error=e))
 
     def _target_buffer(self):
         mode = SMOOTHING.get(self.smoothing)
@@ -329,59 +336,72 @@ class Bridge:
         out_times = collections.deque(maxlen=90)
         buffer_s = 0.0
         last_placeholder = 0.0
+        last_log = last_error_log = time.time()
         ph, ph_text = None, None
         try:
             while self._running:
-                # заглушка, если кадров давно нет
-                if time.time() - rx.last_arrival > 3:
-                    if time.time() - last_placeholder > 1 / max(1, self.fps):
-                        text = "Waiting for MacBook camera..." if rx.last_arrival else "Connecting..."
-                        if ph_text != text:
-                            ph, ph_text = placeholder(self.width, self.height, text), text
-                        self.output = ph
-                        self.output_seq += 1
-                        if self.cam is not None:
-                            self.cam.send(np.asarray(ph))
-                        last_placeholder = time.time()
-                    rx.wait_new(0.05)
-                    continue
-
-                # плавно подстраиваем буфер к измеренной неровности сети
-                target = self._target_buffer()
-                buffer_s += (target - buffer_s) * (0.2 if target > buffer_s else 0.02)
-                if target == 0.0:
-                    buffer_s = 0.0
-                self.buffer_ms = buffer_s * 1000
-                self.jitter_ms = rx.net.jitter_percentile(95) * 1000
-
-                with rx._cv:
-                    if not rx.queue:
-                        rx._cv.wait(0.05)
+                try:
+                    # заглушка, если кадров давно нет
+                    if time.time() - rx.last_arrival > 3:
+                        if time.time() - last_placeholder > 1 / max(1, self.fps):
+                            text = "Waiting for MacBook camera..." if rx.last_arrival else "Connecting..."
+                            if ph_text != text:
+                                ph, ph_text = placeholder(self.width, self.height, text), text
+                            self.output = ph
+                            self.output_seq += 1
+                            self._send_vcam(ph)
+                            last_placeholder = time.time()
+                        rx.wait_new(0.05)
                         continue
-                    ts, arrived, frame = rx.queue[0]
 
-                if buffer_s > 0:
-                    due = ts + rx.net.base() + buffer_s
-                    delay = due - time.time()
-                    if delay > 0:
-                        time.sleep(min(delay, 0.02))
-                        continue
-                with rx._cv:
-                    # если очередь распухла (буфер уменьшился) — пропускаем старые кадры
-                    while len(rx.queue) > 1 and (buffer_s == 0 or
-                                                 rx.queue[1][0] + rx.net.base() + buffer_s <= time.time()):
-                        rx.queue.popleft()
-                    ts, arrived, frame = rx.queue.popleft()
-                self._emit(frame)
+                    # плавно подстраиваем буфер к измеренной неровности сети
+                    target = self._target_buffer()
+                    buffer_s += (target - buffer_s) * (0.2 if target > buffer_s else 0.02)
+                    if target == 0.0:
+                        buffer_s = 0.0
+                    self.buffer_ms = buffer_s * 1000
+                    self.jitter_ms = rx.net.jitter_percentile(95) * 1000
 
-                now = time.time()
-                out_times.append(now)
-                if len(out_times) > 10:
-                    iv = np.diff(np.array(out_times))
-                    self.pacing_ms = float(np.std(iv) * 1000)
+                    with rx._cv:
+                        if not rx.queue:
+                            rx._cv.wait(0.05)
+                            continue
+                        ts, arrived, frame = rx.queue[0]
+
+                    if buffer_s > 0:
+                        due = ts + rx.net.base() + buffer_s
+                        delay = due - time.time()
+                        if delay > 0:
+                            time.sleep(min(delay, 0.02))
+                            continue
+                    with rx._cv:
+                        # если очередь распухла (буфер уменьшился) — пропускаем старые кадры
+                        while len(rx.queue) > 1 and (buffer_s == 0 or
+                                                     rx.queue[1][0] + rx.net.base() + buffer_s <= time.time()):
+                            rx.queue.popleft()
+                        ts, arrived, frame = rx.queue.popleft()
+                    self._emit(frame)
+
+                    now = time.time()
+                    out_times.append(now)
+                    if len(out_times) > 10:
+                        iv = np.diff(np.array(out_times))
+                        self.pacing_ms = float(np.std(iv) * 1000)
+                    if now - last_log >= 30 and rx.connected:
+                        log(tr("log_stats", fps=f"{rx.stats_fps:.1f}", mbps=f"{rx.stats_mbps:.1f}",
+                               jitter=f"{self.jitter_ms:.0f}", buffer=f"{self.buffer_ms:.0f}"))
+                        last_log = now
+                except Exception as e:  # noqa: BLE001  (одна ошибка не должна останавливать вывод видео)
+                    if time.time() - last_error_log >= 5:
+                        log(tr("log_bridge_error", error=repr(e)))
+                        last_error_log = time.time()
+                    time.sleep(0.1)
         finally:
             if self.cam is not None:
-                self.cam.close()
+                try:
+                    self.cam.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def stop(self):
         self._running = False

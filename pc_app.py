@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageTk
 from macbookcam import __version__
 from macbookcam.client import Bridge, _font
 from macbookcam.i18n import LANGUAGES, set_language, tr
-from macbookcam.protocol import DEFAULT_PORT, discover
+from macbookcam.protocol import DEFAULT_PORT, discover, set_log_file
 
 RESOLUTIONS = {"480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
 FPS_OPTIONS = ["15", "24", "30", "60"]
@@ -552,6 +552,8 @@ class App(ctk.CTk):
             notes.append(tr("camera_fallback", reason=rx.info["backend_error"].splitlines()[0][:160]))
         elif rx.info.get("max_fps") and int(self.fps_menu.get()) > rx.info["max_fps"]:
             notes.append(tr("camera_fps_limit", max_fps=rx.info["max_fps"]))
+        version = rx.info.get("app_version")
+        notes.append(tr("mac_app_version", version=version) if version else tr("mac_app_old"))
         notes.append(tr("vcam_name", name=b.vcam_name) if b.vcam_name else tr("vcam_none"))
         self.note.configure(text="\n".join(notes))
 
@@ -579,6 +581,7 @@ class App(ctk.CTk):
 
 
 def main():
+    set_log_file(os.path.join(os.path.dirname(SETTINGS_PATH), "log.txt"))
     if sys.platform == "win32":
         try:
             import ctypes

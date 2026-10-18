@@ -18,7 +18,7 @@ import rumps  # noqa: E402
 
 from macbookcam import __version__  # noqa: E402
 from macbookcam.i18n import LANGUAGES, set_language, tr  # noqa: E402
-from macbookcam.protocol import DEFAULT_PORT, get_local_ips  # noqa: E402
+from macbookcam.protocol import DEFAULT_PORT, get_local_ips, set_log_file  # noqa: E402
 from macbookcam.server import (StreamServer, camera_auth_status, camera_names,  # noqa: E402
                                request_camera_access)
 
@@ -260,6 +260,7 @@ class MacBookCamApp(rumps.App):
 
 
 def main():
+    set_log_file(os.path.expanduser("~/Library/Logs/MacBookCam.log"))
     try:
         import AppKit
         # Без значка в Dock — только в строке меню
